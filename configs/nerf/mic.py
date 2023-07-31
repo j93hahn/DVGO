@@ -4,8 +4,7 @@ expname = 'dvgo_mic'
 basedir = './logs/nerf_synthetic'
 
 data = dict(
-    datadir='./data/nerf_synthetic/mic',
+    datadir='/share/data/pals/jjahn/data/blender/mic',
     dataset_type='blender',
     white_bkgd=True,
 )
-

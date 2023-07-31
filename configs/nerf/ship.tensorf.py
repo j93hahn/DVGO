@@ -4,7 +4,7 @@ expname = 'dvgo_ship_tensorf'
 basedir = './logs/nerf_synthetic'
 
 data = dict(
-    datadir='./data/nerf_synthetic/ship',
+    datadir='/share/data/pals/jjahn/data/blender/ship',
     dataset_type='blender',
     white_bkgd=True,
 )
@@ -22,4 +22,3 @@ fine_model_and_render = dict(
     k0_type='TensoRFGrid',
     k0_config=dict(n_comp=24),
 )
-

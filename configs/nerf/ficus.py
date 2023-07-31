@@ -4,8 +4,7 @@ expname = 'dvgo_ficus'
 basedir = './logs/nerf_synthetic'
 
 data = dict(
-    datadir='./data/nerf_synthetic/ficus',
+    datadir='/share/data/pals/jjahn/data/blender/ficus',
     dataset_type='blender',
     white_bkgd=True,
 )
-
