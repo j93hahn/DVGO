@@ -579,7 +579,8 @@ if __name__=='__main__':
     # load setup
     parser = config_parser()
     args = parser.parse_args()
-    cfg = mmcv.Config.fromfile(args.config)
+    from mmengine import config # solves [AttributeError: module 'mmcv' has no attribute 'Config']
+    cfg = config.Config.fromfile(args.config)
 
     # init enviroment
     if torch.cuda.is_available():
@@ -713,4 +714,3 @@ if __name__=='__main__':
         imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
 
     print('Done')
-
