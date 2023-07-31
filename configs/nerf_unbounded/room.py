@@ -3,7 +3,7 @@ _base_ = './nerf_unbounded_default.py'
 expname = 'dvgo_room_unbounded'
 
 data = dict(
-    datadir='./data/360_v2/room',
+    datadir='/share/data/pals/jjahn/data/real_360/room',
     factor=2, # 1557x1038
     movie_render_kwargs=dict(
         shift_x=0.0,  # positive right
@@ -13,4 +13,3 @@ data = dict(
         pitch_deg=-40, # negative look downward
     ),
 )
-

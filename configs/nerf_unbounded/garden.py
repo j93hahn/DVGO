@@ -3,7 +3,7 @@ _base_ = './nerf_unbounded_default.py'
 expname = 'dvgo_garden_unbounded'
 
 data = dict(
-    datadir='./data/360_v2/garden',
+    datadir='/share/data/pals/jjahn/data/real_360/garden',
     factor=4, # 1297x840
     movie_render_kwargs=dict(
         shift_x=0.0,  # positive right
@@ -13,4 +13,3 @@ data = dict(
         pitch_deg=-30,
     ),
 )
-

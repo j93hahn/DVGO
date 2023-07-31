@@ -3,7 +3,7 @@ _base_ = './nerf_unbounded_default.py'
 expname = 'dvgo_kitchen_unbounded'
 
 data = dict(
-    datadir='./data/360_v2/kitchen',
+    datadir='/share/data/pals/jjahn/data/real_360/kitchen',
     factor=2, # 1558x1039
     movie_render_kwargs=dict(
         shift_y=-0.0,
@@ -11,4 +11,3 @@ data = dict(
         pitch_deg=-40,
     ),
 )
-

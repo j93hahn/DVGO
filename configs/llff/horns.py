@@ -3,6 +3,5 @@ _base_ = './llff_default.py'
 expname = 'horns'
 
 data = dict(
-    datadir='./data/nerf_llff_data/horns',
+    datadir='/share/data/pals/jjahn/data/llff/horns',
 )
-
