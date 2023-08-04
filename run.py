@@ -14,6 +14,7 @@ from lib import utils, dvgo, dcvgo, dmpigo
 from lib.load_data import load_data
 
 from torch_efficient_distloss import flatten_eff_distloss
+from fabric.utils.event import EventStorage, get_event_storage
 
 
 def config_parser():
@@ -55,6 +56,9 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_weights", type=int, default=100000,
                         help='frequency of weight ckpt saving')
+
+    parser.add_argument("--distance_scale", type=float, default=1.0,
+                        help='scale the distance of the scene')
     return parser
 
 
@@ -149,7 +153,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
     depths = np.array(depths)
     bgmaps = np.array(bgmaps)
 
-    return rgbs, depths, bgmaps
+    return rgbs, depths, bgmaps, np.mean(psnrs)
 
 
 def seed_everything():
@@ -268,7 +272,7 @@ def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_
             num_voxels=num_voxels,
             **model_kwargs)
     elif cfg.data.unbounded_inward:
-        print(f'scene_rep_reconstruction ({stage}): \033[96muse contraced voxel grid (covering unbounded)\033[0m')
+        print(f'scene_rep_reconstruction ({stage}): \033[96muse contracted voxel grid (covering unbounded)\033[0m')
         model = dcvgo.DirectContractedVoxGO(
             xyz_min=xyz_min, xyz_max=xyz_max,
             num_voxels=num_voxels,
@@ -300,6 +304,8 @@ def load_existed_model(args, cfg, cfg_train, reload_ckpt_path):
 
 def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, data_dict, stage, coarse_ckpt_path=None):
     # init
+    if stage == 'fine':
+        metric = get_event_storage()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if abs(cfg_model.world_bound_scale - 1) > 1e-9:
         xyz_shift = (xyz_max - xyz_min) * (cfg_model.world_bound_scale - 1) / 2
@@ -487,6 +493,10 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         optimizer.step()
         psnr_lst.append(psnr.item())
 
+        if stage == 'fine':
+            metric.put_scalars(psnr=psnr.item(), loss=loss.item())
+            metric.step()
+
         # update lr
         decay_steps = cfg_train.lrate_decay * 1000
         decay_factor = 0.1 ** (1/decay_steps)
@@ -628,7 +638,8 @@ if __name__=='__main__':
 
     # train
     if not args.render_only:
-        train(args, cfg, data_dict)
+        with EventStorage():
+            train(args, cfg, data_dict)
 
     # load model for rendring
     if args.render_test or args.render_train or args.render_video:
@@ -665,7 +676,7 @@ if __name__=='__main__':
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_train_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
         print('All results are dumped into', testsavedir)
-        rgbs, depths, bgmaps = render_viewpoints(
+        rgbs, depths, bgmaps, avg_train_psnr = render_viewpoints(
                 render_poses=data_dict['poses'][data_dict['i_train']],
                 HW=data_dict['HW'][data_dict['i_train']],
                 Ks=data_dict['Ks'][data_dict['i_train']],
@@ -673,15 +684,20 @@ if __name__=='__main__':
                 savedir=testsavedir, dump_images=args.dump_images,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
+        with open(os.path.join(testsavedir, 'psnr.txt'), 'w') as f:
+            f.write(f'avg train psnr = {avg_train_psnr:.4f}\n')
+        for i in range(rgbs.shape[0]):
+            os.makedirs(os.path.join(testsavedir, 'rgb_images'), exist_ok=True)
+            imageio.imwrite(os.path.join(testsavedir, 'rgb_images', f'train_pose_{i}.png'), utils.to8b(rgbs[i]))
 
     # render testset and eval
     if args.render_test:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_test_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
         print('All results are dumped into', testsavedir)
-        rgbs, depths, bgmaps = render_viewpoints(
+        rgbs, depths, bgmaps, avg_test_psnr = render_viewpoints(
                 render_poses=data_dict['poses'][data_dict['i_test']],
                 HW=data_dict['HW'][data_dict['i_test']],
                 Ks=data_dict['Ks'][data_dict['i_test']],
@@ -689,15 +705,20 @@ if __name__=='__main__':
                 savedir=testsavedir, dump_images=args.dump_images,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
+        with open(os.path.join(testsavedir, 'psnr.txt'), 'w') as f:
+            f.write(f'average test psnr = {avg_test_psnr:.4f}\n')
+        for i in range(rgbs.shape[0]):
+            os.makedirs(os.path.join(testsavedir, 'rgb_images'), exist_ok=True)
+            imageio.imwrite(os.path.join(testsavedir, 'rgb_images', f'test_pose_{i}.png'), utils.to8b(rgbs[i]))
 
     # render video
     if args.render_video:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_video_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
         print('All results are dumped into', testsavedir)
-        rgbs, depths, bgmaps = render_viewpoints(
+        rgbs, depths, bgmaps, avg_test_psnr = render_viewpoints(
                 render_poses=data_dict['render_poses'],
                 HW=data_dict['HW'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
                 Ks=data_dict['Ks'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
@@ -706,11 +727,11 @@ if __name__=='__main__':
                 render_video_rot90=args.render_video_rot90,
                 savedir=testsavedir, dump_images=args.dump_images,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
         import matplotlib.pyplot as plt
         depths_vis = depths * (1-bgmaps) + bgmaps
         dmin, dmax = np.percentile(depths_vis[bgmaps < 0.1], q=[5, 95])
         depth_vis = plt.get_cmap('rainbow')(1 - np.clip((depths_vis - dmin) / (dmax - dmin), 0, 1)).squeeze()[..., :3]
-        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video_depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
 
     print('Done')
