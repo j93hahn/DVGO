@@ -630,4 +630,3 @@ def batch_indices_generator(N, BS):
             idx, top = torch.LongTensor(np.random.permutation(N)), 0
         yield idx[top:top+BS]
         top += BS
-
