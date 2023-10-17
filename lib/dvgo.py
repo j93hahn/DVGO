@@ -8,8 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch_scatter import segment_coo
+from scratch.algos.rays import weighted_percentile
+from scratch.algos.grid import sample_grid_box
 
-from . import grid
+from . import grid, utils
 from torch.utils.cpp_extension import load
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 render_utils_cuda = load(
@@ -32,6 +34,7 @@ class DirectVoxGO(torch.nn.Module):
                  rgbnet_dim=0, rgbnet_direct=False, rgbnet_full_implicit=False,
                  rgbnet_depth=3, rgbnet_width=128,
                  viewbase_pe=4,
+                 distance_scale=1.0,
                  **kwargs):
         super(DirectVoxGO, self).__init__()
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
@@ -44,7 +47,9 @@ class DirectVoxGO(torch.nn.Module):
 
         # determine the density bias shift
         self.alpha_init = alpha_init
-        self.register_buffer('act_shift', torch.FloatTensor([np.log(1/(1-alpha_init) - 1)]))
+        # self.register_buffer('act_shift', torch.FloatTensor([np.log(1/(1-alpha_init) - 1)]))
+        self.register_buffer('act_shift', torch.FloatTensor([utils.calculate_density_shift(alpha_init, 0.5, distance_scale)]))
+        self.act_shift = self.act_shift.to('cuda')
         print('dvgo: set density bias shift to', self.act_shift)
 
         # determine init grid resolution
@@ -57,6 +62,7 @@ class DirectVoxGO(torch.nn.Module):
                 density_type, channels=1, world_size=self.world_size,
                 xyz_min=self.xyz_min, xyz_max=self.xyz_max,
                 config=self.density_config)
+        self.distance_scale = distance_scale
 
         # init color representation
         self.rgbnet_kwargs = {
@@ -252,7 +258,11 @@ class DirectVoxGO(torch.nn.Module):
     def activate_density(self, density, interval=None):
         interval = interval if interval is not None else self.voxel_size_ratio
         shape = density.shape
-        return Raw2Alpha.apply(density.flatten(), self.act_shift, interval).reshape(shape)
+        # new implementation - handles distance scalings much better (alpha invariance)
+        return (1. - torch.exp(-torch.exp(density.flatten() + self.act_shift) * interval * self.distance_scale)).reshape(shape)
+
+        # old implementation - softplus activation is not well-suited compared to exp
+        return Raw2Alpha.apply(density.flatten(), self.act_shift, interval * self.distance_scale).reshape(shape)
 
     def hit_coarse_geo(self, rays_o, rays_d, near, far, stepsize, **render_kwargs):
         '''Check whether the rays hit the solved coarse geometry or not'''
@@ -292,13 +302,78 @@ class DirectVoxGO(torch.nn.Module):
         step_id = step_id[mask_inbbox]
         return ray_pts, ray_id, step_id
 
+    def forward3(self, pts):
+        return self.density(pts.to('cuda'))
+
+    def forward2(self, rays_o, rays_d, **render_kwargs):
+        assert len(rays_o.shape)==2 and rays_o.shape[-1]==3, 'Only support point queries in [N, 3] format'
+
+        N = len(rays_o)
+
+        # sample points on rays
+        ray_pts, ray_id, step_id = self.sample_ray(
+                rays_o=rays_o, rays_d=rays_d, **render_kwargs)
+
+        interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+        # skip known free space
+        if self.mask_cache is not None:
+            mask = self.mask_cache(ray_pts)
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            step_id = step_id[mask]
+
+        ray_pts = sample_grid_box(torch.tensor([200, 200, 200]), 'cuda')
+        # breakpoint()
+
+        # query for alpha w/ post-activation
+        density = self.density(ray_pts)
+        breakpoint()
+        alpha = self.activate_density(density, interval * self.distance_scale)
+        if self.fast_color_thres > 0:
+            mask = (alpha > self.fast_color_thres)
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            step_id = step_id[mask]
+            density = density[mask]
+            alpha = alpha[mask]
+
+        # compute accumulated transmittance
+        weights, _ = Alphas2Weights.apply(alpha, ray_id, N)
+        if self.fast_color_thres > 0:
+            mask = (weights > self.fast_color_thres)
+            weights = weights[mask]
+            alpha = alpha[mask]
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            step_id = step_id[mask]
+            density = density[mask]
+
+        sigmas = torch.zeros(size=(N, 1), dtype=torch.float32)
+        xyz_locs = torch.ones(size=(N, 3), dtype=torch.float32) * -25.0
+
+        # iterate through ray_id, extract indices for each ray in _ind
+        # then extract the weights for each ray, compute 50th percentile, extract
+        # the indices for those 50th percentiles and then index into the ray_pts
+        # vector to get that point
+
+        for curr_ray in ray_id.unique():
+            batch_idxs = torch.where(ray_id == curr_ray)[0]
+            curr_ray_pts = ray_pts[batch_idxs]
+            curr_density = density[batch_idxs]
+            idx = weighted_percentile(weights[batch_idxs])
+
+            sigmas[curr_ray] = curr_density[idx]
+            xyz_locs[curr_ray] = curr_ray_pts[idx]
+
+        return sigmas, xyz_locs
+
     def forward(self, rays_o, rays_d, viewdirs, global_step=None, **render_kwargs):
         '''Volume rendering
         @rays_o:   [N, 3] the starting point of the N shooting rays.
         @rays_d:   [N, 3] the shooting direction of the N rays.
         @viewdirs: [N, 3] viewing direction to compute positional embedding for MLP.
         '''
-        assert len(rays_o.shape)==2 and rays_o.shape[-1]==3, 'Only suuport point queries in [N, 3] format'
+        assert len(rays_o.shape)==2 and rays_o.shape[-1]==3, 'Only support point queries in [N, 3] format'
 
         ret_dict = {}
         N = len(rays_o)
@@ -306,7 +381,21 @@ class DirectVoxGO(torch.nn.Module):
         # sample points on rays
         ray_pts, ray_id, step_id = self.sample_ray(
                 rays_o=rays_o, rays_d=rays_d, **render_kwargs)
-        interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+
+        # compute interval length
+        if 1 > 0:   # default DVGO implementation
+            interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+        else: # --- expected implementation ---
+            vec = torch.where(rays_d==0, torch.full_like(rays_d, 1e-6), rays_d)
+            rate_a = (self.xyz_max - rays_o) / vec
+            rate_b = (self.xyz_min - rays_o) / vec
+            t_min = torch.minimum(rate_a, rate_b).amax(-1).clamp(min=render_kwargs['near'], max=render_kwargs['far'])
+            N_samples = int(np.linalg.norm(np.array(self.world_size.cpu())+1) / render_kwargs['stepsize']) + 1
+            rng = torch.arange(N_samples)[None].float()
+            step = render_kwargs['stepsize'] * self.voxel_size * rng
+            interpx = (t_min[...,None] + step/rays_d.norm(dim=-1,keepdim=True))
+            interval = (interpx[...,1:] - interpx[...,:-1]) * rays_d.norm(dim=-1,keepdim=True)
+            interval = interval.mean().item()
 
         # skip known free space
         if self.mask_cache is not None:
