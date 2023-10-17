@@ -323,11 +323,9 @@ class DirectVoxGO(torch.nn.Module):
             step_id = step_id[mask]
 
         ray_pts = sample_grid_box(torch.tensor([200, 200, 200]), 'cuda')
-        # breakpoint()
 
         # query for alpha w/ post-activation
         density = self.density(ray_pts)
-        breakpoint()
         alpha = self.activate_density(density, interval * self.distance_scale)
         if self.fast_color_thres > 0:
             mask = (alpha > self.fast_color_thres)

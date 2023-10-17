@@ -28,6 +28,7 @@ class DirectMPIGO(torch.nn.Module):
                  rgbnet_depth=3, rgbnet_width=128,
                  viewbase_pe=0,
                  distance_scale=1.0,
+                 stepsize=None,
                  **kwargs):
         super(DirectMPIGO, self).__init__()
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
@@ -47,23 +48,28 @@ class DirectMPIGO(torch.nn.Module):
 
         self.distance_scale = distance_scale
         self.alpha_init = alpha_init
+        self.stepsize = stepsize
         self.register_buffer('act_shift_scalar', torch.FloatTensor(
             [utils.calculate_density_shift(self.alpha_init, 1.0, distance_scale)]
-        ))
+        ))  # don't use this - suboptimal performance
 
         # init density bias so that the initial contribution (the alpha values)
         # of each query points on a ray is equal
+        α0 = 1e-3 if distance_scale == 0.01 else 1e-6   # too small α0 causes numerical underflow
         self.act_shift = grid.DenseGrid(
                 channels=1, world_size=[1,1,mpi_depth],
                 xyz_min=xyz_min, xyz_max=xyz_max)
         self.act_shift.grid.requires_grad = False
         with torch.no_grad():
-            g = np.full([mpi_depth], 1./mpi_depth - 1e-6)
+            g = np.full([mpi_depth], 1./mpi_depth - α0)
             p = [1-g[0]]
             for i in range(1, len(g)):
                 p.append((1-g[:i+1].sum())/(1-g[:i].sum()))
             for i in range(len(p)):
-                self.act_shift.grid[..., i].fill_(np.log(p[i] ** (-1/self.voxel_size_ratio) - 1))
+                self.act_shift.grid[..., i].fill_(np.log(p[i] ** (-1/(
+                    self.voxel_size_ratio *
+                    self.stepsize * distance_scale  # calculation should be dependent on scene scaling
+                )) - 1))
 
         # init color representation
         # feature voxel grid + shallow MLP  (fine stage)
@@ -144,6 +150,7 @@ class DirectMPIGO(torch.nn.Module):
             'xyz_min': self.xyz_min.cpu().numpy(),
             'xyz_max': self.xyz_max.cpu().numpy(),
             'alpha_init': self.alpha_init,
+            'stepsize': self.stepsize,
             'num_voxels': self.num_voxels,
             'mpi_depth': self.mpi_depth,
             'voxel_size_ratio': self.voxel_size_ratio,
@@ -230,7 +237,8 @@ class DirectMPIGO(torch.nn.Module):
     def activate_density(self, density, interval=None):
         interval = interval if interval is not None else self.voxel_size_ratio
         shape = density.shape
-        return (1. - torch.exp(-torch.exp(density.flatten() + self.act_shift_scalar) * interval * self.distance_scale)).reshape(shape)
+        return (1. - torch.exp(-torch.exp(density.flatten() + 0) * interval * self.distance_scale)).reshape(shape)
+        # return (1. - torch.exp(-torch.exp(density.flatten() + self.act_shift_scalar) * interval * self.distance_scale)).reshape(shape)
         # return Raw2Alpha.apply(density.flatten(), 0, interval * self.distance_scale).reshape(shape)
 
     def sample_ray(self, rays_o, rays_d, near, far, stepsize, **render_kwargs):
@@ -359,8 +367,7 @@ class DirectMPIGO(torch.nn.Module):
             step_id = step_id[mask]
 
         # query for alpha w/ post-activation
-        # breakpoint()
-        density = self.density(ray_pts)# + self.act_shift(ray_pts)
+        density = self.density(ray_pts) + self.act_shift(ray_pts)
         alpha = self.activate_density(density, interval)
         if self.fast_color_thres > 0:
             mask = (alpha > self.fast_color_thres)
