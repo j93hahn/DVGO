@@ -129,3 +129,14 @@ def rgb_lpips(np_gt, np_im, net_name, device):
     im = torch.from_numpy(np_im).permute([2, 0, 1]).contiguous().to(device)
     return __LPIPS__[net_name](gt, im, normalize=True).item()
 
+"""
+New heuristic for calculating the density shift inside of DVGO's rendering routine.
+
+Previously, DVGO used a naive implementation of np.log(1 / (1 - alpha_init) - 1)
+but this is scale-agnostic and does not take into account the distance scale of the scene.
+
+Our method takes into account distance scaling and is much more robust to different
+scene scalings.
+"""
+def calculate_density_shift(alpha_init, interval, distance_scale):
+    return np.log(np.log(1.0 - alpha_init) / (-interval * distance_scale))
