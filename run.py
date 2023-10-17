@@ -59,6 +59,10 @@ def config_parser():
 
     parser.add_argument("--distance_scale", type=float, default=1.0,
                         help='scale the distance of the scene')
+    parser.add_argument("--index", type=int, default=0,
+                        help='image to extract the sigma visualization from')
+    parser.add_argument("--load_pts", type=str,
+                        help='path to load xyz points from when sampling sigmas')
     return parser
 
 
@@ -259,7 +263,7 @@ def compute_bbox_by_coarse_geo(model_class, model_path, thres):
     print('compute_bbox_by_coarse_geo: finish (eps time:', eps_time, 'secs)')
     return xyz_min, xyz_max
 
-def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_ckpt_path):
+def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_ckpt_path, distance_scale=1.0):
     model_kwargs = copy.deepcopy(cfg_model)
     num_voxels = model_kwargs.pop('num_voxels')
     if len(cfg_train.pg_scale):
@@ -270,12 +274,14 @@ def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_
         model = dmpigo.DirectMPIGO(
             xyz_min=xyz_min, xyz_max=xyz_max,
             num_voxels=num_voxels,
+            distance_scale=distance_scale,
             **model_kwargs)
     elif cfg.data.unbounded_inward:
         print(f'scene_rep_reconstruction ({stage}): \033[96muse contracted voxel grid (covering unbounded)\033[0m')
         model = dcvgo.DirectContractedVoxGO(
             xyz_min=xyz_min, xyz_max=xyz_max,
             num_voxels=num_voxels,
+            distance_scale=distance_scale,
             **model_kwargs)
     else:
         print(f'scene_rep_reconstruction ({stage}): \033[96muse dense voxel grid\033[0m')
@@ -283,6 +289,7 @@ def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_
             xyz_min=xyz_min, xyz_max=xyz_max,
             num_voxels=num_voxels,
             mask_cache_path=coarse_ckpt_path,
+            distance_scale=distance_scale,
             **model_kwargs)
     model = model.to(device)
     optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
@@ -331,7 +338,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     # init model and optimizer
     if reload_ckpt_path is None:
         print(f'scene_rep_reconstruction ({stage}): train from scratch')
-        model, optimizer = create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_ckpt_path)
+        model, optimizer = create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_ckpt_path, args.distance_scale)
         start = 0
         if cfg_model.maskout_near_cam_vox:
             model.maskout_near_cam_vox(poses[i_train,:3,3], near)
@@ -641,7 +648,7 @@ if __name__=='__main__':
         with EventStorage():
             train(args, cfg, data_dict)
 
-    # load model for rendring
+    # load model for rendering
     if args.render_test or args.render_train or args.render_video:
         if args.ft_path:
             ckpt_path = args.ft_path
@@ -655,6 +662,7 @@ if __name__=='__main__':
         else:
             model_class = dvgo.DirectVoxGO
         model = utils.load_model(model_class, ckpt_path).to(device)
+        model.distance_scale = args.distance_scale
         stepsize = cfg.fine_model_and_render.stepsize
         render_viewpoints_kwargs = {
             'model': model,
@@ -707,7 +715,7 @@ if __name__=='__main__':
                 **render_viewpoints_kwargs)
         imageio.mimwrite(os.path.join(testsavedir, 'video_rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
         imageio.mimwrite(os.path.join(testsavedir, 'video_depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
-        with open(os.path.join(testsavedir, 'psnr.txt'), 'w') as f:
+        with open('psnr.txt', 'w') as f:
             f.write(f'average test psnr = {avg_test_psnr:.4f}\n')
         for i in range(rgbs.shape[0]):
             os.makedirs(os.path.join(testsavedir, 'rgb_images'), exist_ok=True)

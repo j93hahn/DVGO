@@ -9,14 +9,16 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 from torch_scatter import scatter_add, segment_coo
+from scratch.algos.rays import weighted_percentile
 
-from . import grid
+from . import grid, utils
 from .dvgo import Raw2Alpha, Alphas2Weights, render_utils_cuda
 
 
 '''Model'''
 class DirectMPIGO(torch.nn.Module):
     def __init__(self, xyz_min, xyz_max,
+                 alpha_init=None,
                  num_voxels=0, mpi_depth=0,
                  mask_cache_path=None, mask_cache_thres=1e-3, mask_cache_world_size=None,
                  fast_color_thres=0,
@@ -25,6 +27,7 @@ class DirectMPIGO(torch.nn.Module):
                  rgbnet_dim=0,
                  rgbnet_depth=3, rgbnet_width=128,
                  viewbase_pe=0,
+                 distance_scale=1.0,
                  **kwargs):
         super(DirectMPIGO, self).__init__()
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
@@ -41,6 +44,12 @@ class DirectMPIGO(torch.nn.Module):
                 density_type, channels=1, world_size=self.world_size,
                 xyz_min=self.xyz_min, xyz_max=self.xyz_max,
                 config=self.density_config)
+
+        self.distance_scale = distance_scale
+        self.alpha_init = alpha_init
+        self.register_buffer('act_shift_scalar', torch.FloatTensor(
+            [utils.calculate_density_shift(self.alpha_init, 1.0, distance_scale)]
+        ))
 
         # init density bias so that the initial contribution (the alpha values)
         # of each query points on a ray is equal
@@ -125,6 +134,7 @@ class DirectMPIGO(torch.nn.Module):
         self.world_size = torch.zeros(3, dtype=torch.long)
         self.world_size[:2] = (self.xyz_max - self.xyz_min)[:2] * r
         self.world_size[2] = self.mpi_depth
+        self.voxel_size = ((self.xyz_max - self.xyz_min).prod() / num_voxels).pow(1/3)
         self.voxel_size_ratio = 256. / mpi_depth
         print('dmpigo: world_size      ', self.world_size)
         print('dmpigo: voxel_size_ratio', self.voxel_size_ratio)
@@ -133,6 +143,7 @@ class DirectMPIGO(torch.nn.Module):
         return {
             'xyz_min': self.xyz_min.cpu().numpy(),
             'xyz_max': self.xyz_max.cpu().numpy(),
+            'alpha_init': self.alpha_init,
             'num_voxels': self.num_voxels,
             'mpi_depth': self.mpi_depth,
             'voxel_size_ratio': self.voxel_size_ratio,
@@ -219,7 +230,8 @@ class DirectMPIGO(torch.nn.Module):
     def activate_density(self, density, interval=None):
         interval = interval if interval is not None else self.voxel_size_ratio
         shape = density.shape
-        return Raw2Alpha.apply(density.flatten(), 0, interval).reshape(shape)
+        return (1. - torch.exp(-torch.exp(density.flatten() + self.act_shift_scalar) * interval * self.distance_scale)).reshape(shape)
+        # return Raw2Alpha.apply(density.flatten(), 0, interval * self.distance_scale).reshape(shape)
 
     def sample_ray(self, rays_o, rays_d, near, far, stepsize, **render_kwargs):
         '''Sample query points on rays.
@@ -248,6 +260,67 @@ class DirectMPIGO(torch.nn.Module):
             step_id = torch.arange(mask_inbbox.shape[1]).view(1,-1).expand_as(mask_inbbox)[mask_inbbox]
         return ray_pts, ray_id, step_id, N_samples
 
+    def forward3(self, pts):
+        return self.density(pts.to('cuda'))
+
+    def forward2(self, rays_o, rays_d, **render_kwargs):
+        assert len(rays_o.shape)==2 and rays_o.shape[-1]==3, 'Only support point queries in [N, 3] format'
+
+        N = len(rays_o)
+
+        # sample points on rays
+        ray_pts, ray_id, step_id, N_samples = self.sample_ray(
+                rays_o=rays_o, rays_d=rays_d, **render_kwargs)
+
+        interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+        # skip known free space
+        if self.mask_cache is not None:
+            mask = self.mask_cache(ray_pts)
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            step_id = step_id[mask]
+
+        # query for alpha w/ post-activation
+        density = self.density(ray_pts) + self.act_shift(ray_pts)
+        alpha = self.activate_density(density, interval)
+        if self.fast_color_thres > 0:
+            mask = (alpha > self.fast_color_thres)
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            density = density[mask]
+            step_id = step_id[mask]
+            alpha = alpha[mask]
+
+        # compute accumulated transmittance
+        weights, _ = Alphas2Weights.apply(alpha, ray_id, N)
+        if self.fast_color_thres > 0:
+            mask = (weights > self.fast_color_thres)
+            ray_pts = ray_pts[mask]
+            ray_id = ray_id[mask]
+            step_id = step_id[mask]
+            alpha = alpha[mask]
+            density = density[mask]
+            weights = weights[mask]
+
+        sigmas = torch.zeros(size=(N, 1), dtype=torch.float32)
+        xyz_locs = torch.ones(size=(N, 3), dtype=torch.float32) * -25.0
+
+        # iterate through ray_id, extract indices for each ray in _ind
+        # then extract the weights for each ray, compute 50th percentile, extract
+        # the indices for those 50th percentiles and then index into the ray_pts
+        # vector to get that point
+
+        for curr_ray in ray_id.unique():
+            batch_idxs = torch.where(ray_id == curr_ray)[0]
+            curr_ray_pts = ray_pts[batch_idxs]
+            curr_density = density[batch_idxs]
+            idx = weighted_percentile(weights[batch_idxs])
+
+            sigmas[curr_ray] = curr_density[idx]
+            xyz_locs[curr_ray] = curr_ray_pts[idx]
+
+        return sigmas, xyz_locs
+
     def forward(self, rays_o, rays_d, viewdirs, global_step=None, **render_kwargs):
         '''Volume rendering
         @rays_o:   [N, 3] the starting point of the N shooting rays.
@@ -262,7 +335,21 @@ class DirectMPIGO(torch.nn.Module):
         # sample points on rays
         ray_pts, ray_id, step_id, N_samples = self.sample_ray(
                 rays_o=rays_o, rays_d=rays_d, **render_kwargs)
-        interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+
+        # compute interval length
+        if 1 > 0:
+            interval = render_kwargs['stepsize'] * self.voxel_size_ratio
+        else: # --- expected implementation ---
+            vec = torch.where(rays_d==0, torch.full_like(rays_d, 1e-6), rays_d)
+            rate_a = (self.xyz_max - rays_o) / vec
+            rate_b = (self.xyz_min - rays_o) / vec
+            t_min = torch.minimum(rate_a, rate_b).amax(-1).clamp(min=render_kwargs['near'], max=render_kwargs['far'])
+            N_samples = int(np.linalg.norm(np.array(self.world_size.cpu())+1) / render_kwargs['stepsize']) + 1
+            rng = torch.arange(N_samples)[None].float()
+            step = render_kwargs['stepsize'] * self.voxel_size * rng
+            interpx = (t_min[...,None] + step/rays_d.norm(dim=-1,keepdim=True))
+            interval = (interpx[...,1:] - interpx[...,:-1]) * rays_d.norm(dim=-1,keepdim=True)
+            interval = interval.mean().item()
 
         # skip known free space
         if self.mask_cache is not None:
@@ -272,7 +359,8 @@ class DirectMPIGO(torch.nn.Module):
             step_id = step_id[mask]
 
         # query for alpha w/ post-activation
-        density = self.density(ray_pts) + self.act_shift(ray_pts)
+        # breakpoint()
+        density = self.density(ray_pts)# + self.act_shift(ray_pts)
         alpha = self.activate_density(density, interval)
         if self.fast_color_thres > 0:
             mask = (alpha > self.fast_color_thres)
@@ -345,4 +433,3 @@ def create_full_step_id(shape):
     ray_id = torch.arange(shape[0]).view(-1,1).expand(shape).flatten()
     step_id = torch.arange(shape[1]).view(1,-1).expand(shape).flatten()
     return ray_id, step_id
-
