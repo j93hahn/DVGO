@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 from torch_scatter import scatter_add, segment_coo
-from scratch.algos.rays import weighted_percentile
+from scratch.j3d.rays import weighted_percentile
 
 from . import grid, utils
 from .dvgo import Raw2Alpha, Alphas2Weights, render_utils_cuda
@@ -66,10 +66,12 @@ class DirectMPIGO(torch.nn.Module):
             for i in range(1, len(g)):
                 p.append((1-g[:i+1].sum())/(1-g[:i].sum()))
             for i in range(len(p)):
-                self.act_shift.grid[..., i].fill_(np.log(p[i] ** (-1/(
+                prev_val = np.log(p[i] ** (-1/(
                     self.voxel_size_ratio *
                     self.stepsize * distance_scale  # calculation should be dependent on scene scaling
-                )) - 1))
+                )) - 1)
+                new_val = utils.calculate_density_shift(self.alpha_init, 1, distance_scale)
+                self.act_shift.grid[..., i].fill_(new_val)
 
         # init color representation
         # feature voxel grid + shallow MLP  (fine stage)

@@ -138,5 +138,5 @@ but this is scale-agnostic and does not take into account the distance scale of 
 Our method takes into account distance scaling and is much more robust to different
 scene scalings.
 """
-def calculate_density_shift(alpha_init, interval, distance_scale):
-    return np.log(np.log(1.0 - alpha_init) / (-interval * distance_scale))
+def calculate_density_shift(alpha_init, L, distance_scale):
+    return np.log(np.log(1 / (1 - alpha_init))) - np.log(L * distance_scale)

@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch_scatter import segment_coo
-from scratch.algos.rays import weighted_percentile
-from scratch.algos.grid import sample_grid_box
+from scratch.j3d.rays import weighted_percentile
+from scratch.j3d.grid import sample_grid_box
 
 from . import grid, utils
 from torch.utils.cpp_extension import load
@@ -48,7 +48,7 @@ class DirectVoxGO(torch.nn.Module):
         # determine the density bias shift
         self.alpha_init = alpha_init
         # self.register_buffer('act_shift', torch.FloatTensor([np.log(1/(1-alpha_init) - 1)]))
-        self.register_buffer('act_shift', torch.FloatTensor([utils.calculate_density_shift(alpha_init, 0.5, distance_scale)]))
+        self.register_buffer('act_shift', torch.FloatTensor([utils.calculate_density_shift(alpha_init, 4.0, distance_scale)]))
         self.act_shift = self.act_shift.to('cuda')
         print('dvgo: set density bias shift to', self.act_shift)
 

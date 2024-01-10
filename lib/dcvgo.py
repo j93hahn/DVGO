@@ -12,7 +12,7 @@ from torch_scatter import segment_coo
 from . import grid, utils
 from .dvgo import Raw2Alpha, Alphas2Weights
 from .dmpigo import create_full_step_id
-from scratch.algos.rays import weighted_percentile
+from scratch.j3d.rays import weighted_percentile
 
 from torch.utils.cpp_extension import load
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -69,7 +69,9 @@ class DirectContractedVoxGO(nn.Module):
         # determine the density bias shift
         self.alpha_init = alpha_init
         # self.register_buffer('act_shift', torch.FloatTensor([np.log(1/(1-alpha_init) - 1)]))
-        self.register_buffer('act_shift', torch.FloatTensor([utils.calculate_density_shift(alpha_init, 3.1748, distance_scale)]))
+        # near, far bounds used from the bounding box of the scene
+        # true metric far-plane is 1e9 but we obviously cannot use the metric length as it will force the entire scene to be transparent
+        self.register_buffer('act_shift', torch.FloatTensor([utils.calculate_density_shift(alpha_init, 2.289, distance_scale)]))
         self.act_shift = self.act_shift.to('cuda')
         print('dcvgo: set density bias shift to', self.act_shift)
 
